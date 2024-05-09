@@ -32,15 +32,19 @@ jobs:
 
       - name: Set receptor pypi version
         run: echo RECEPTORCTL_PYPI_VERSION=$(curl --silent https://pypi.org/pypi/receptorctl/json | jq --raw-output '.info.version') >> $GITHUB_ENV
+
+      - name: Log
+        run: echo "${{ 'v%{env.RECEPTORCTL_PYPI_VERSION}' }}"
+
+      - name: Log
+        run: echo "${{ env.TAG }}"
       
       - name: Log
-        run: echo 'v%{env.RECEPTORCTL_PYPI_VERSION}' != env.TAG
+        run: cat $GITHUB_ENV
 
       - name: Log
-        run: echo 'v%{env.RECEPTORCTL_PYPI_VERSION}'
-
-      - name: Log
-        run: echo env.TAG
+        if: ${{ 'v%{env.RECEPTORCTL_PYPI_VERSION}' != env.TAG }}
+        run: echo true
 
   #     - name: Build receptorctl and upload to pypi
   #       if: ${{ 'v%{env.RECEPTORCTL_PYPI_VERSION}' != env.TAG }}
