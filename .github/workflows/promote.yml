@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # TAG: ${{github.event.release.tag_name}}
-      TAG: v1.4.6
+      TAG: 1.4.6
     steps:
       - name: Checkout Receptor
         uses: actions/checkout@v4
