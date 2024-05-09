@@ -35,10 +35,10 @@ jobs:
         run: echo RECEPTORCTL_PYPI_VERSION=$(curl --silent https://pypi.org/pypi/receptorctl/json | jq --raw-output '.info.version') >> $GITHUB_ENV
 
       - name: Log
-        run: echo ${{ 'v%{env.RECEPTORCTL_PYPI_VERSION}' }}
+        run: echo ${{ env.RECEPTORCTL_PYPI_VERSION }}
 
       - name: Log
-        run: echo "${{ env.TAG }}"
+        run: echo ${{ env.TAG }}
       
       - name: Log
         run: cat $GITHUB_ENV
