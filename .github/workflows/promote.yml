@@ -33,73 +33,82 @@ jobs:
 
       - name: Set receptor pypi version
         run: echo RECEPTORCTL_PYPI_VERSION=$(curl --silent https://pypi.org/pypi/receptorctl/json | jq --raw-output '.info.version') >> $GITHUB_ENV
+      
+      - name: Log
+        run: echo 'v%{env.RECEPTORCTL_PYPI_VERSION}' != env.TAG
 
-      - name: Build receptorctl and upload to pypi
-        if: ${{ 'v%{env.RECEPTORCTL_PYPI_VERSION}' != env.TAG }}
-        run: |
-          make receptorctl_wheel receptorctl_sdist VERSION=$TAG
-          twine upload \
-            -r ${{ env.pypi_repo }} \
-            -u ${{ secrets.PYPI_USERNAME }} \
-            -p ${{ secrets.PYPI_PASSWORD }} \
-            receptorctl/dist/*
+      - name: Log
+        run: echo 'v%{env.RECEPTORCTL_PYPI_VERSION}'
 
-      - name: Log in to GHCR
-        run: |
-          echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Log
+        run: echo env.TAG
 
-      - name: Log in to Quay
-        run: |
-          echo ${{ secrets.QUAY_TOKEN }} | docker login quay.io -u ${{ secrets.QUAY_USER }} --password-stdin
+  #     - name: Build receptorctl and upload to pypi
+  #       if: ${{ 'v%{env.RECEPTORCTL_PYPI_VERSION}' != env.TAG }}
+  #       run: |
+  #         make receptorctl_wheel receptorctl_sdist VERSION=$TAG
+  #         twine upload \
+  #           -r ${{ env.pypi_repo }} \
+  #           -u ${{ secrets.PYPI_USERNAME }} \
+  #           -p ${{ secrets.PYPI_PASSWORD }} \
+  #           receptorctl/dist/*
 
-      - name: Copy Image to Quay
-        uses: akhilerm/tag-push-action@v2.2.0
-        with:
-          src: ghcr.io/${{ github.repository }}:${{env.TAG}}
-          dst: |
-            quay.io/${{ github.repository }}:${{env.TAG}}
-            quay.io/${{ github.repository }}:latest
+  #     - name: Log in to GHCR
+  #       run: |
+  #         echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Check if floating tag is needed
-        run: |
-          if [[ $TAG == *"dev"* ]];
-          then
-           echo "FLOATING_TAG=$(echo $TAG | sed 's/[0-9]\+$//')" >> $GITHUB_ENV
-          else
-           echo "FLOATING_TAG=$TAG" >> $GITHUB_ENV
-          fi
+  #     - name: Log in to Quay
+  #       run: |
+  #         echo ${{ secrets.QUAY_TOKEN }} | docker login quay.io -u ${{ secrets.QUAY_USER }} --password-stdin
 
-      - name: Push floating tag to Quay
-        uses: akhilerm/tag-push-action@v2.2.0
-        with:
-          src: ghcr.io/${{ github.repository }}:${{env.TAG}}
-          dst: quay.io/${{ github.repository }}:${{env.FLOATING_TAG}}
+  #     - name: Copy Image to Quay
+  #       uses: akhilerm/tag-push-action@v2.2.0
+  #       with:
+  #         src: ghcr.io/${{ github.repository }}:${{env.TAG}}
+  #         dst: |
+  #           quay.io/${{ github.repository }}:${{env.TAG}}
+  #           quay.io/${{ github.repository }}:latest
 
-  publish:
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{github.event.release.tag_name}}
-    steps:
-      - name: Checkout Receptor
-        uses: actions/checkout@v4
+  #     - name: Check if floating tag is needed
+  #       run: |
+  #         if [[ $TAG == *"dev"* ]];
+  #         then
+  #          echo "FLOATING_TAG=$(echo $TAG | sed 's/[0-9]\+$//')" >> $GITHUB_ENV
+  #         else
+  #          echo "FLOATING_TAG=$TAG" >> $GITHUB_ENV
+  #         fi
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.20"
+  #     - name: Push floating tag to Quay
+  #       uses: akhilerm/tag-push-action@v2.2.0
+  #       with:
+  #         src: ghcr.io/${{ github.repository }}:${{env.TAG}}
+  #         dst: quay.io/${{ github.repository }}:${{env.FLOATING_TAG}}
 
-      - name: Build packages
-        run: |
-          make build-package GOOS=linux GOARCH=amd64 BINNAME=receptor
-          make build-package GOOS=linux GOARCH=arm64 BINNAME=receptor
-          make build-package GOOS=darwin GOARCH=amd64 BINNAME=receptor
-          make build-package GOOS=darwin GOARCH=arm64 BINNAME=receptor
-          make build-package GOOS=windows GOARCH=amd64 BINNAME=receptor.exe
-          make build-package GOOS=windows GOARCH=arm64 BINNAME=receptor.exe
+  # publish:
+  #   runs-on: ubuntu-latest
+  #   env:
+  #     VERSION: ${{github.event.release.tag_name}}
+  #   steps:
+  #     - name: Checkout Receptor
+  #       uses: actions/checkout@v4
 
-      - name: Publish packages
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |-
-            dist/checksums.txt
-            dist/*.tar.gz
+  #     - name: Set up Go
+  #       uses: actions/setup-go@v5
+  #       with:
+  #         go-version: "1.20"
+
+  #     - name: Build packages
+  #       run: |
+  #         make build-package GOOS=linux GOARCH=amd64 BINNAME=receptor
+  #         make build-package GOOS=linux GOARCH=arm64 BINNAME=receptor
+  #         make build-package GOOS=darwin GOARCH=amd64 BINNAME=receptor
+  #         make build-package GOOS=darwin GOARCH=arm64 BINNAME=receptor
+  #         make build-package GOOS=windows GOARCH=amd64 BINNAME=receptor.exe
+  #         make build-package GOOS=windows GOARCH=arm64 BINNAME=receptor.exe
+
+  #     - name: Publish packages
+  #       uses: softprops/action-gh-release@v2
+  #       with:
+  #         files: |-
+  #           dist/checksums.txt
+  #           dist/*.tar.gz
