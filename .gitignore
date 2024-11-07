@@ -2,7 +2,7 @@
 .idea
 .vscode
 kind
-receptor
+# receptor
 receptor.exe
 receptor.app
 recepcert
