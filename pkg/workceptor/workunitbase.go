@@ -81,6 +81,7 @@ type BaseWorkUnit struct {
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	fs                  FileSystemer
+	completionDecremented bool    // tracks if running jobs count was already decremented for completion
 }
 
 // Init initializes the basic work unit data, in memory only.
@@ -251,7 +252,29 @@ func (bwu *BaseWorkUnit) Load() error {
 	bwu.statusLock.Lock()
 	defer bwu.statusLock.Unlock()
 
-	return bwu.status.Load(bwu.statusFileName)
+	// Track previous state before loading to detect completion transitions
+	previousState := bwu.status.State
+
+	err := bwu.status.Load(bwu.statusFileName)
+	if err != nil {
+		return err
+	}
+
+	// Check if we transitioned to a complete state and trigger lease recycling
+	nowComplete := IsComplete(bwu.status.State)
+	currentState := bwu.status.State
+	shouldDecrement := nowComplete && !bwu.completionDecremented
+
+	bwu.w.nc.GetLogger().Debug("Job %s Load() completion check: previousState=%d, currentState=%d, nowComplete=%t, completionDecremented=%t, shouldDecrement=%t",
+		bwu.unitID, previousState, currentState, nowComplete, bwu.completionDecremented, shouldDecrement)
+
+	if shouldDecrement {
+		bwu.w.DecrementRunningJobs()
+		bwu.completionDecremented = true
+		bwu.w.nc.GetLogger().Debug("Job %s completed via Load(), decremented running jobs count", bwu.unitID)
+	}
+
+	return nil
 }
 
 // UpdateFullStatus atomically updates the status metadata file.  Changes should be made in the callback function.
@@ -337,6 +360,10 @@ func (bwu *BaseWorkUnit) UpdateBasicStatus(state int, detail string, stdoutSize 
 	bwu.statusLock.Lock()
 	defer bwu.statusLock.Unlock()
 
+	// Capture previous state to detect completion transitions
+	previousState := bwu.status.State
+	nowComplete := IsComplete(state)
+
 	err := bwu.status.UpdateBasicStatus(bwu.statusFileName, state, detail, stdoutSize)
 	bwu.lastUpdateErrorLock.Lock()
 	defer bwu.lastUpdateErrorLock.Unlock()
@@ -344,6 +371,17 @@ func (bwu *BaseWorkUnit) UpdateBasicStatus(state int, detail string, stdoutSize 
 
 	if err != nil {
 		bwu.w.nc.GetLogger().Error("Error updating status file %s: %s.", bwu.statusFileName, err)
+	}
+
+	// Track job completion for lease management
+	// Decrement when job completes, but only once per job
+	shouldDecrement := nowComplete && !bwu.completionDecremented
+	bwu.w.nc.GetLogger().Debug("Job %s status update: previousState=%d, nowComplete=%t, completionDecremented=%t, shouldDecrement=%t",
+		bwu.unitID, previousState, nowComplete, bwu.completionDecremented, shouldDecrement)
+	if shouldDecrement {
+		bwu.w.DecrementRunningJobs()
+		bwu.completionDecremented = true
+		bwu.w.nc.GetLogger().Debug("Job %s completed, decremented running jobs count", bwu.unitID)
 	}
 }
 
@@ -358,10 +396,29 @@ func (bwu *BaseWorkUnit) LastUpdateError() error {
 // MonitorLocalStatus watches a unit dir and keeps the in-memory workUnit up to date with status changes.
 func (bwu *BaseWorkUnit) MonitorLocalStatus() {
 	statusFile := path.Join(bwu.UnitDir(), "status")
+	bwu.w.nc.GetLogger().Debug("Starting MonitorLocalStatus for job %s, statusFile: %s", bwu.unitID, statusFile)
+
+	// Capture initial state for completion tracking
+	bwu.statusLock.RLock()
+	initialState := bwu.status.State
+	bwu.statusLock.RUnlock()
+	bwu.w.nc.GetLogger().Debug("MonitorLocalStatus initial state for job %s: %d", bwu.unitID, initialState)
+
 	fi, err := bwu.fs.Stat(statusFile)
 	if err != nil {
 		bwu.w.nc.GetLogger().Error("Error retrieving stat for %s: %s", statusFile, err)
 		fi = nil
+	}
+
+	// Check if file already exists and load initial state, tracking completion properly
+	if fi != nil {
+		bwu.w.nc.GetLogger().Debug("MonitorLocalStatus found existing status file for job %s", bwu.unitID)
+
+		// Use the Load() method directly to ensure proper completion detection
+		err := bwu.Load()
+		if err != nil {
+			bwu.w.nc.GetLogger().Error("MonitorLocalStatus initial load error for %s: %s", statusFile, err)
+		}
 	}
 
 loop:
@@ -373,6 +430,7 @@ loop:
 			newFi, err := bwu.fs.Stat(statusFile)
 			if err == nil && (fi == nil || fi.ModTime() != newFi.ModTime()) {
 				fi = newFi
+				bwu.w.nc.GetLogger().Debug("MonitorLocalStatus detected file change for job %s", bwu.unitID)
 				err = bwu.Load()
 				if err != nil {
 					bwu.w.nc.GetLogger().Error("Work unit load Error reading %s: %s", statusFile, err)

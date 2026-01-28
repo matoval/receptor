@@ -61,6 +61,10 @@ type Workceptor struct {
 	SigningKey        string
 	SigningExpiration time.Duration
 	VerifyingKey      string
+
+	// Lease management
+	leaseManager            *LeaseManager
+	leaseEnforcementEnabled bool
 }
 
 // workType is the record for a registered type of work.
@@ -394,6 +398,25 @@ func (w *Workceptor) scanForUnits() {
 		fi := files[i]
 		w.scanForUnit(fi.Name())
 	}
+
+	// After loading all units, ensure running jobs count is accurate for lease management
+	if w.IsLeaseEnforcementEnabled() {
+		w.activeUnitsLock.RLock()
+		actualRunningCount := 0
+		for _, unit := range w.activeUnits {
+			status := unit.Status()
+			if status != nil && !IsComplete(status.State) {
+				actualRunningCount++
+			}
+		}
+		w.activeUnitsLock.RUnlock()
+
+		// Reset running jobs count to match actual state
+		if w.leaseManager != nil {
+			w.leaseManager.ResetRunningJobsCount(actualRunningCount)
+			w.nc.GetLogger().Debug("Reset running jobs count to %d based on actual job states", actualRunningCount)
+		}
+	}
 }
 
 func (w *Workceptor) findUnit(unitID string) (WorkUnit, error) {
@@ -622,4 +645,78 @@ func (w *Workceptor) GetResults(ctx context.Context, unitID string, startPos int
 	}()
 
 	return resultChan, nil
+}
+
+// Lease management error constants as specified in pullPlan.md
+var (
+	ErrLeaseRequired = fmt.Errorf("LEASE_REQUIRED")
+	ErrLeaseInvalid  = fmt.Errorf("LEASE_INVALID")
+	ErrLeaseExpired  = fmt.Errorf("LEASE_EXPIRED")
+	ErrLeaseUsed     = fmt.Errorf("LEASE_USED")
+)
+
+// SetLeaseManager sets the lease manager for this workceptor instance.
+func (w *Workceptor) SetLeaseManager(lm *LeaseManager) {
+	w.leaseManager = lm
+	// Enable lease enforcement if a lease manager is set
+	w.leaseEnforcementEnabled = (lm != nil)
+	if lm != nil {
+		w.nc.GetLogger().Info("Lease enforcement enabled for workceptor")
+	}
+}
+
+// GetLeaseManager returns the current lease manager, if any.
+func (w *Workceptor) GetLeaseManager() *LeaseManager {
+	return w.leaseManager
+}
+
+// IsLeaseEnforcementEnabled returns true if lease enforcement is enabled.
+func (w *Workceptor) IsLeaseEnforcementEnabled() bool {
+	return w.leaseEnforcementEnabled && w.leaseManager != nil
+}
+
+// ValidateLeaseForSubmit validates and consumes a lease token for work submission.
+// Returns appropriate lease error codes on failure.
+func (w *Workceptor) ValidateLeaseForSubmit(jobID, token string) error {
+	if !w.IsLeaseEnforcementEnabled() {
+		return nil // No validation if enforcement is disabled
+	}
+
+	if token == "" {
+		w.nc.GetLogger().Debug("Lease required but not provided for job %s", jobID)
+		return ErrLeaseRequired
+	}
+
+	err := w.leaseManager.ValidateAndConsumeLease(jobID, token)
+	if err != nil {
+		// Map lease manager errors to workceptor error constants
+		switch err.Error() {
+		case "LEASE_INVALID":
+			return ErrLeaseInvalid
+		case "LEASE_EXPIRED":
+			return ErrLeaseExpired
+		case "LEASE_USED":
+			return ErrLeaseUsed
+		default:
+			w.nc.GetLogger().Error("Unexpected lease validation error for job %s: %s", jobID, err)
+			return ErrLeaseInvalid
+		}
+	}
+
+	w.nc.GetLogger().Debug("Lease validated and consumed for job %s", jobID)
+	return nil
+}
+
+// IncrementRunningJobs notifies the lease manager that a job has started.
+func (w *Workceptor) IncrementRunningJobs() {
+	if w.leaseManager != nil {
+		w.leaseManager.IncrementRunningJobs()
+	}
+}
+
+// DecrementRunningJobs notifies the lease manager that a job has completed.
+func (w *Workceptor) DecrementRunningJobs() {
+	if w.leaseManager != nil {
+		w.leaseManager.DecrementRunningJobs()
+	}
 }

@@ -45,6 +45,7 @@ type ReceptorConfig struct {
 	WorkKubernetes    []*workceptor.KubeWorkerCfg      `mapstructure:"work-kubernetes"`
 	WorkSigning       workceptor.SigningKeyPrivateCfg  `mapstructure:"work-signing"`
 	WorkVerification  workceptor.VerifyingKeyPublicCfg `mapstructure:"work-verification"`
+	LeaseServices     []*workceptor.LeaseServiceCfg    `mapstructure:"lease-services"`
 	IPRouters         []services.IPRouterCfg
 	TCPClients        []services.TCPProxyOutboundCfg  `mapstructure:"tcp-clients"`
 	TCPServers        []services.TCPProxyInboundCfg   `mapstructure:"tcp-servers"`

@@ -4,7 +4,11 @@
 package workceptor
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -257,7 +261,7 @@ func (c *workceptorCommand) ControlFunc(ctx context.Context, nc controlsvc.Netce
 			workUnitID = ""
 		}
 		workParams := make(map[string]string)
-		nonParams := []string{"command", "subcommand", "node", "worktype", "tlsclient", "ttl", "signwork", "signature"}
+		nonParams := []string{"command", "subcommand", "node", "worktype", "tlsclient", "ttl", "signwork", "signature", "workUnitID", "lease_token"}
 		inNonParams := func(p string) bool {
 			for _, nonparam := range nonParams {
 				if p == nonparam {
@@ -277,6 +281,29 @@ func (c *workceptorCommand) ControlFunc(ctx context.Context, nc controlsvc.Netce
 			}
 			workParams[k] = vStr
 		}
+
+		// Extract lease token for validation
+		leaseToken, err := strFromMap(c.params, "lease_token")
+		if err != nil {
+			leaseToken = ""
+		}
+
+
+		// Validate lease if enforcement is enabled
+		if c.w.IsLeaseEnforcementEnabled() {
+			// Use provided workUnitID or generate a temporary one for validation
+			jobID := workUnitID
+			if jobID == "" {
+				jobID = "temp_" + generateRandomID()
+			}
+			err = c.w.ValidateLeaseForSubmit(jobID, leaseToken)
+			if err != nil {
+				return nil, err // Returns specific lease error codes
+			}
+			// Note: Do not increment here - increment only when work actually starts
+			c.w.nc.GetLogger().Debug("Lease validated for job %s", jobID)
+		}
+
 		err = c.processSignature(workType, signature, connIsUnix, signWork)
 		if err != nil {
 			return nil, err
@@ -289,7 +316,12 @@ func (c *workceptorCommand) ControlFunc(ctx context.Context, nc controlsvc.Netce
 			}
 			worker, err = c.w.AllocateUnit(workType, workUnitID, workParams)
 		} else {
-			worker, err = c.w.AllocateRemoteUnit(workNode, workType, workUnitID, tlsClient, ttl, signWork, workParams)
+			// Check if target node has lease service - if so, use lease-based scheduling
+			if hasLeaseService(nc, workNode) {
+				worker, err = c.allocateRemoteUnitWithLease(nc, workNode, workType, workUnitID, tlsClient, ttl, signWork, workParams)
+			} else {
+				worker, err = c.w.AllocateRemoteUnit(workNode, workType, workUnitID, tlsClient, ttl, signWork, workParams)
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -314,8 +346,14 @@ func (c *workceptorCommand) ControlFunc(ctx context.Context, nc controlsvc.Netce
 			return nil, err
 		}
 		worker.UpdateBasicStatus(WorkStatePending, "Starting Worker", 0)
+
+		// Increment running jobs count when starting work
+		c.w.IncrementRunningJobs()
+
 		err = worker.Start()
 		if err != nil && !IsPending(err) {
+			// Decrement if start failed immediately
+			c.w.DecrementRunningJobs()
 			worker.UpdateBasicStatus(WorkStateFailed, fmt.Sprintf("Error starting worker: %s", err), 0)
 
 			return cfr, err
@@ -445,4 +483,96 @@ func (c *workceptorCommand) ControlFunc(ctx context.Context, nc controlsvc.Netce
 	}
 
 	return nil, fmt.Errorf("bad command")
+}
+
+// generateRandomID creates a random ID for temporary job validation
+func generateRandomID() string {
+	bytes := make([]byte, 4)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
+
+// hasLeaseService checks if the target node advertises a lease service
+func hasLeaseService(nc controlsvc.NetceptorForControlCommand, targetNode string) bool {
+	status := nc.Status()
+
+	MainInstance.nc.GetLogger().Debug("hasLeaseService checking for target node: %s", targetNode)
+	for _, ad := range status.Advertisements {
+		MainInstance.nc.GetLogger().Debug("hasLeaseService found advertisement: NodeID=%s, Service=%s, Tags=%v", ad.NodeID, ad.Service, ad.Tags)
+		if ad.NodeID == targetNode && ad.Service == "lease" {
+			MainInstance.nc.GetLogger().Debug("hasLeaseService found lease service for %s", targetNode)
+			if tags, ok := ad.Tags["type"]; ok && tags == "Worker Node" {
+				MainInstance.nc.GetLogger().Debug("hasLeaseService confirmed Worker Node type for %s", targetNode)
+				return true
+			} else {
+				MainInstance.nc.GetLogger().Debug("hasLeaseService wrong tags for %s: type=%s, ok=%v", targetNode, tags, ok)
+			}
+		}
+	}
+	MainInstance.nc.GetLogger().Debug("hasLeaseService returning false for %s", targetNode)
+	return false
+}
+
+// allocateRemoteUnitWithLease handles remote work submission with lease-based scheduling
+func (c *workceptorCommand) allocateRemoteUnitWithLease(nc controlsvc.NetceptorForControlCommand, workNode, workType, workUnitID, tlsClient, ttl string, signWork bool, workParams map[string]string) (WorkUnit, error) {
+	// Generate job ID for lease request - this will become the work unit ID
+	jobID := workUnitID
+	if jobID == "" {
+		// Pre-generate the work unit ID so lease request and work submission use the same ID
+		jobID = nc.NodeID() + generateRandomID()
+	}
+
+	// Connect to worker's lease service and request lease
+	conn, err := nc.Dial(workNode, "lease", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to lease service on %s: %v", workNode, err)
+	}
+	defer conn.Close()
+
+	// Send lease request
+	request := map[string]interface{}{
+		"type":    "lease_request",
+		"job_id":  jobID,
+		"ttl_ms":  10000, // 10 seconds
+	}
+	requestData, _ := json.Marshal(request)
+	_, err = conn.Write(append(requestData, '\n'))
+	if err != nil {
+		return nil, fmt.Errorf("failed to send lease request: %v", err)
+	}
+
+	// Read lease response
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lease response: %v", err)
+	}
+
+	var response map[string]interface{}
+	err = json.Unmarshal(line[:len(line)-1], &response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse lease response: %v", err)
+	}
+
+	// Check if lease was granted
+	if responseType, ok := response["type"].(string); !ok || responseType != "lease_grant" {
+		if reason, ok := response["reason"].(string); ok {
+			return nil, fmt.Errorf("lease denied: %s", reason)
+		}
+		return nil, fmt.Errorf("lease denied")
+	}
+
+	leaseToken, ok := response["lease_token"].(string)
+	if !ok || leaseToken == "" {
+		return nil, fmt.Errorf("invalid lease response: missing token")
+	}
+
+	// Include lease token in work parameters so it gets sent to the remote node
+	workParamsWithLease := make(map[string]string)
+	for k, v := range workParams {
+		workParamsWithLease[k] = v
+	}
+	workParamsWithLease["lease_token"] = leaseToken
+
+	return c.w.AllocateRemoteUnit(workNode, workType, jobID, tlsClient, ttl, signWork, workParamsWithLease)
 }
