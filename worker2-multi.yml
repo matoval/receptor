@@ -1,0 +1,33 @@
+---
+- node:
+    id: worker2
+
+- log-level: debug
+
+- control-service:
+    service: control
+    filename: /tmp/worker2.sock
+
+- lease-service:
+    service: lease
+    maxrunningjobs: 1
+    maxoutstandingleases: 1
+    leasettlms: 10000
+    draining: false
+
+- work-command:
+    worktype: shell
+    command: bash
+    params: "-c"
+    allowruntimeparams: true
+
+- work-command:
+    worktype: countdown
+    command: bash
+    params: '-c "echo STARTING_5_SECOND_COUNTDOWN && for i in {1..5}; do echo \"$(date +%H:%M:%S): Worker2 Countdown second $i/5\"; sleep 1; done && echo WORKER2_COUNTDOWN_COMPLETE"'
+
+- tcp-listener:
+    port: 7002
+
+- tcp-peer:
+    address: localhost:7000

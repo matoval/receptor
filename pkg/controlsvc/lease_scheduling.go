@@ -153,57 +153,70 @@ func OrderWorkersByJobHash(workers []string, jobID string) []string {
 // ScheduleJobWithLease implements the lease-first scheduling algorithm as specified in pullPlan.md.
 // It discovers workers, orders them deterministically, and tries each worker sequentially until
 // one grants a lease and accepts the work submission.
-func ScheduleJobWithLease(nc NetceptorForControlCommand, jobID string, submitParams map[string]interface{}, maxWorkers int) error {
+func ScheduleJobWithLease(nc NetceptorForControlCommand, jobID string, submitParams map[string]interface{}, maxRetries int) error {
 	logger := nc.GetLogger()
 
-	if maxWorkers <= 0 {
-		maxWorkers = 5 // Default from spec
+	if maxRetries <= 0 {
+		maxRetries = 5 // Default from spec
 	}
 
 	// Step 1: Discover worker nodes
 	workers := DiscoverWorkerNodes(nc)
 	if len(workers) == 0 {
-		return fmt.Errorf("no worker nodes discovered")
+		return fmt.Errorf("no workers discovered with lease services")
 	}
 
 	// Step 2: Order workers deterministically by stable hash
 	orderedWorkers := OrderWorkersByJobHash(workers, jobID)
 
 	// Step 3: Limit to max workers to try
-	if len(orderedWorkers) > maxWorkers {
-		orderedWorkers = orderedWorkers[:maxWorkers]
+	workersToTry := orderedWorkers
+	if len(orderedWorkers) > maxRetries {
+		workersToTry = orderedWorkers[:maxRetries]
 	}
 
-	logger.Info("Attempting to schedule job %s on %d workers: %v", jobID, len(orderedWorkers), orderedWorkers)
+	logger.Info("Attempting to schedule job %s on %d/%d workers: %v", jobID, len(workersToTry), len(workers), workersToTry)
 
-	// Step 4: Try each worker sequentially
+	// Step 4: Try each worker sequentially with enhanced error tracking
 	var lastError error
-	for i, workerNode := range orderedWorkers {
-		logger.Debug("Trying worker %d/%d: %s for job %s", i+1, len(orderedWorkers), workerNode, jobID)
+	var busyWorkers []string
+	var failedWorkers []string
+
+	for i, workerNode := range workersToTry {
+		logger.Debug("Trying worker %d/%d: %s for job %s", i+1, len(workersToTry), workerNode, jobID)
 
 		// Request lease (using default TTL from spec: 10 seconds)
 		leaseResponse, err := RequestLeaseFromWorker(nc, workerNode, jobID, 10000)
 		if err != nil {
-			lastError = err
+			lastError = fmt.Errorf("worker %s lease request failed: %w", workerNode, err)
+			failedWorkers = append(failedWorkers, workerNode)
 			logger.Debug("Failed to request lease from worker %s: %s", workerNode, err)
 			continue
 		}
 
 		// Check if lease was granted
 		if leaseResponse.Type == "lease_deny" {
-			lastError = fmt.Errorf("lease denied by worker %s: %s", workerNode, leaseResponse.Reason)
+			if leaseResponse.Reason == "BUSY" {
+				busyWorkers = append(busyWorkers, workerNode)
+				lastError = fmt.Errorf("worker %s denied lease: BUSY", workerNode)
+			} else {
+				failedWorkers = append(failedWorkers, workerNode)
+				lastError = fmt.Errorf("worker %s denied lease: %s", workerNode, leaseResponse.Reason)
+			}
 			logger.Debug("Lease denied by worker %s: %s", workerNode, leaseResponse.Reason)
 			continue
 		}
 
 		if leaseResponse.Type != "lease_grant" {
 			lastError = fmt.Errorf("unexpected response type from worker %s: %s", workerNode, leaseResponse.Type)
+			failedWorkers = append(failedWorkers, workerNode)
 			logger.Debug("Unexpected response type from worker %s: %s", workerNode, leaseResponse.Type)
 			continue
 		}
 
 		if leaseResponse.Token == "" {
 			lastError = fmt.Errorf("worker %s granted lease but provided empty token", workerNode)
+			failedWorkers = append(failedWorkers, workerNode)
 			logger.Debug("Worker %s granted lease but provided empty token", workerNode)
 			continue
 		}
@@ -221,12 +234,36 @@ func ScheduleJobWithLease(nc NetceptorForControlCommand, jobID string, submitPar
 		return nil
 	}
 
-	// All workers failed
-	if lastError != nil {
-		return fmt.Errorf("all %d workers failed or denied lease for job %s, last error: %w", len(orderedWorkers), jobID, lastError)
+	// Enhanced error reporting based on failure types
+	totalTried := len(busyWorkers) + len(failedWorkers)
+
+	if len(busyWorkers) == totalTried && len(busyWorkers) > 0 {
+		// All workers were busy
+		return fmt.Errorf("all %d workers denied lease due to capacity (tried: %v)", len(busyWorkers), busyWorkers)
 	}
 
-	return fmt.Errorf("all %d workers failed for job %s", len(orderedWorkers), jobID)
+	if len(failedWorkers) == totalTried && len(failedWorkers) > 0 {
+		// All workers had communication or other failures
+		return fmt.Errorf("failed to obtain lease from any worker (tried %d/%d workers): %w",
+			len(workersToTry), len(workers), lastError)
+	}
+
+	if totalTried > 0 {
+		// Mixed failures
+		errorMsg := fmt.Sprintf("failed to obtain lease from any worker (tried %d/%d workers)",
+			len(workersToTry), len(workers))
+		if len(busyWorkers) > 0 {
+			errorMsg += fmt.Sprintf(", %d workers busy: %v", len(busyWorkers), busyWorkers)
+		}
+		if len(failedWorkers) > 0 {
+			errorMsg += fmt.Sprintf(", %d workers failed", len(failedWorkers))
+		}
+		errorMsg += fmt.Sprintf(": %s", lastError)
+		return fmt.Errorf(errorMsg)
+	}
+
+	// Fallback error (shouldn't happen)
+	return fmt.Errorf("failed to obtain lease from any of %d workers for job %s", len(workersToTry), jobID)
 }
 
 // SubmitJobWithLeaseScheduling is a high-level function that combines lease scheduling with job submission.
@@ -252,7 +289,7 @@ func SubmitJobWithLeaseScheduling(nc NetceptorForControlCommand, workType, jobID
 
 	logger.Info("Starting lease-based scheduling for job %s, worktype %s", jobID, workType)
 
-	// Perform lease-first scheduling
+	// Perform lease-first scheduling with enhanced error reporting
 	err := ScheduleJobWithLease(nc, jobID, submitParams, 5)
 	if err != nil {
 		return nil, fmt.Errorf("lease scheduling failed for job %s: %w", jobID, err)

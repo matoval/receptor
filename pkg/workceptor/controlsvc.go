@@ -77,6 +77,16 @@ func (t *workceptorCommandType) InitFromString(params string) (controlsvc.Contro
 		} else {
 			c.params["startpos"] = int64(0)
 		}
+	case "submit_auto":
+		if len(tokens) < 2 {
+			return nil, fmt.Errorf("work submit_auto requires a work type")
+		}
+		c.params["worktype"] = tokens[1]
+		if len(tokens) > 2 {
+			c.params["params"] = strings.Join(tokens[2:], " ")
+		}
+		// Mark as auto-submit to prevent node parameter
+		c.params["_auto_submit"] = true
 	}
 
 	return c, nil
@@ -194,6 +204,29 @@ func (t *workceptorCommandType) InitFromJSON(config map[string]interface{}) (con
 		if err == nil {
 			c.params["signature"] = signature
 		}
+	case "submit_auto":
+		workType, err := strFromMap(config, "worktype")
+		if err != nil {
+			return nil, err
+		}
+		c.params["worktype"] = workType
+
+		// Explicitly prohibit node parameter
+		if _, exists := config["node"]; exists {
+			return nil, fmt.Errorf("submit_auto does not accept 'node' parameter - worker is automatically selected")
+		}
+
+		// Copy all other parameters except reserved ones
+		for k, v := range config {
+			if k != "command" && k != "subcommand" && k != "worktype" {
+				_, ok := v.(string)
+				if !ok {
+					return nil, fmt.Errorf("submit_auto parameters must all be strings and %s is not", k)
+				}
+				c.params[k] = v
+			}
+		}
+		c.params["_auto_submit"] = true
 	}
 
 	return c, nil
@@ -480,9 +513,167 @@ func (c *workceptorCommand) ControlFunc(ctx context.Context, nc controlsvc.Netce
 		}
 
 		return nil, nil
+	case "submit_auto":
+		return c.executeAutoSubmit(ctx, nc, cfo)
 	}
 
 	return nil, fmt.Errorf("bad command")
+}
+
+// executeAutoSubmit implements automatic worker selection and job submission
+func (c *workceptorCommand) executeAutoSubmit(ctx context.Context, nc controlsvc.NetceptorForControlCommand, cfo controlsvc.ControlFuncOperations) (map[string]interface{}, error) {
+	// Extract standard parameters
+	workType, err := strFromMap(c.params, "worktype")
+	if err != nil {
+		return nil, err
+	}
+
+	tlsClient, err := strFromMap(c.params, "tlsclient")
+	if err != nil {
+		tlsClient = ""
+	}
+
+	ttl, err := strFromMap(c.params, "ttl")
+	if err != nil {
+		ttl = ""
+	}
+
+	signWork, err := boolFromMap(c.params, "signwork")
+	if err != nil {
+		signWork = false
+	}
+
+	workUnitID, err := strFromMap(c.params, "workUnitID")
+	if err != nil {
+		// Leave empty - AllocateRemoteUnit will generate one
+		workUnitID = ""
+	}
+
+	// Build work parameters (same logic as existing submit)
+	workParams := make(map[string]string)
+	nonParams := []string{"command", "subcommand", "worktype", "tlsclient", "ttl", "signwork", "signature", "workUnitID", "_auto_submit"}
+
+	inNonParams := func(p string) bool {
+		for _, nonparam := range nonParams {
+			if p == nonparam {
+				return true
+			}
+		}
+		return false
+	}
+
+	for k, v := range c.params {
+		if ok := inNonParams(k); ok {
+			continue
+		}
+		vStr, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s must be a string", k)
+		}
+		workParams[k] = vStr
+	}
+
+	// Discover workers with lease services
+	workers := controlsvc.DiscoverWorkerNodes(nc)
+	if len(workers) == 0 {
+		return nil, fmt.Errorf("no worker nodes with lease services found in the mesh")
+	}
+
+	// Use a temporary job ID for worker ordering if workUnitID is empty
+	orderingID := workUnitID
+	if orderingID == "" {
+		orderingID = nc.NodeID() + "-" + generateRandomID()
+	}
+
+	// Try workers in deterministic order based on job ID
+	orderedWorkers := controlsvc.OrderWorkersByJobHash(workers, orderingID)
+
+	var worker WorkUnit
+	var lastError error
+	var selectedWorker string
+
+	// Try up to 5 workers
+	maxTries := 5
+	if len(orderedWorkers) < maxTries {
+		maxTries = len(orderedWorkers)
+	}
+
+	for i := 0; i < maxTries; i++ {
+		selectedWorker = orderedWorkers[i]
+
+		// Use the existing lease-based allocation method
+		worker, err = c.allocateRemoteUnitWithLease(nc, selectedWorker, workType, workUnitID, tlsClient, ttl, signWork, workParams)
+		if err != nil {
+			lastError = fmt.Errorf("worker %s: %w", selectedWorker, err)
+			continue
+		}
+
+		// Success - break out of loop
+		break
+	}
+
+	if worker == nil {
+		if lastError != nil {
+			return nil, fmt.Errorf("failed to allocate work on any worker: %w", lastError)
+		}
+		return nil, fmt.Errorf("no workers available for work allocation")
+	}
+
+	// Prepare response with worker selection metadata
+	cfr := map[string]interface{}{
+		"unitid":          worker.ID(),
+		"selected_worker": selectedWorker,
+	}
+
+	// Handle stdin input (same as existing submit)
+	stdin, err := os.OpenFile(path.Join(worker.UnitDir(), "stdin"), os.O_CREATE+os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+
+	worker.UpdateBasicStatus(WorkStatePending, "Waiting for Input Data", 0)
+	err = cfo.ReadFromConn(fmt.Sprintf("Work unit created with ID %s. Send stdin data and EOF.\n", worker.ID()), stdin, &controlsvc.SocketConnIO{})
+	if err != nil {
+		worker.UpdateBasicStatus(WorkStateFailed, fmt.Sprintf("Error reading input data: %s", err), 0)
+		return nil, err
+	}
+
+	err = stdin.Close()
+	if err != nil {
+		worker.UpdateBasicStatus(WorkStateFailed, fmt.Sprintf("Error reading input data: %s", err), 0)
+		return nil, err
+	}
+
+	worker.UpdateBasicStatus(WorkStatePending, "Starting Worker", 0)
+
+	// Increment running jobs count when starting work
+	c.w.IncrementRunningJobs()
+
+	err = worker.Start()
+	if err != nil && !IsPending(err) {
+		// Decrement if start failed immediately
+		c.w.DecrementRunningJobs()
+		worker.UpdateBasicStatus(WorkStateFailed, fmt.Sprintf("Error starting worker: %s", err), 0)
+		return cfr, err
+	}
+
+	// Set result field after successful worker start (matches original submit pattern)
+	if IsPending(err) {
+		cfr["result"] = "Job Submitted"
+	} else {
+		cfr["result"] = "Job Started"
+	}
+
+	return cfr, nil
+}
+
+// allocateRemoteUnitWithToken submits work to a specific worker using provided lease token
+func (c *workceptorCommand) allocateRemoteUnitWithToken(nc controlsvc.NetceptorForControlCommand, workNode, workType, workUnitID, tlsClient, ttl string, signWork bool, leaseToken string, workParams map[string]string) (WorkUnit, error) {
+	// Add lease token to work parameters
+	workParams["lease_token"] = leaseToken
+
+	// Use existing remote unit allocation
+	return c.w.AllocateRemoteUnit(workNode, workType, workUnitID, tlsClient, ttl, signWork, workParams)
 }
 
 // generateRandomID creates a random ID for temporary job validation

@@ -1,0 +1,27 @@
+---
+- node:
+    id: control1
+
+- log-level: debug
+
+- control-service:
+    service: control
+    filename: /tmp/control1.sock
+
+- tcp-listener:
+    port: 7000
+
+- tcp-peer:
+    address: localhost:7001
+
+- tcp-peer:
+    address: localhost:7002
+
+- tcp-peer:
+    address: localhost:7003
+
+- tcp-peer:
+    address: localhost:7004
+
+- tcp-peer:
+    address: localhost:7005
