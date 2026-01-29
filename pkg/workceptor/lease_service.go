@@ -41,20 +41,31 @@ type LeaseResponse struct {
 
 // LeaseService runs the lease service that handles lease requests via newline-delimited JSON
 // over Netceptor stream connections. It advertises itself as a "lease" service with
-// the "Worker Node" type tag to enable worker discovery.
+// the "Worker Node" type tag to enable worker discovery. Optionally advertises pool membership.
 func LeaseService(ctx context.Context, nc NetceptorForLeaseService, service string,
-	tlscfg *tls.Config, leaseManager *LeaseManager) error {
+	tlscfg *tls.Config, pool string, leaseManager *LeaseManager) error {
 	logger := nc.GetLogger()
 
-	// Listen and advertise the lease service with Worker Node tag
-	listener, err := nc.ListenAndAdvertise(service, tlscfg, map[string]string{
+	// Build advertisement tags
+	tags := map[string]string{
 		"type": "Worker Node",
-	})
+	}
+	if pool != "" {
+		tags["pool"] = pool
+		logger.Info("Lease service will advertise pool membership: %s", pool)
+	}
+
+	// Listen and advertise the lease service with Worker Node tag and optional pool tag
+	listener, err := nc.ListenAndAdvertise(service, tlscfg, tags)
 	if err != nil {
 		return fmt.Errorf("error listening and advertising lease service: %s", err)
 	}
 
-	logger.Info("Lease service started on service '%s'", service)
+	if pool != "" {
+		logger.Info("Lease service started on service '%s' (pool: %s)", service, pool)
+	} else {
+		logger.Info("Lease service started on service '%s'", service)
+	}
 
 	// Start the accept loop in a goroutine
 	go func() {

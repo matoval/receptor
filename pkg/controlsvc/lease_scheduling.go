@@ -32,8 +32,9 @@ type LeaseResponse struct {
 }
 
 // DiscoverWorkerNodes discovers worker nodes by finding services advertising the "lease" service
-// with the "Worker Node" type tag. This uses the existing service advertisement mechanism.
-func DiscoverWorkerNodes(nc NetceptorForControlCommand) []string {
+// with the "Worker Node" type tag. Optionally filters by pool name if poolName is non-empty.
+// This uses the existing service advertisement mechanism.
+func DiscoverWorkerNodes(nc NetceptorForControlCommand, poolName string) []string {
 	status := nc.Status()
 	workers := make([]string, 0)
 	logger := nc.GetLogger()
@@ -42,13 +43,27 @@ func DiscoverWorkerNodes(nc NetceptorForControlCommand) []string {
 	for _, ad := range status.Advertisements {
 		if ad.Service == "lease" {
 			if adType, ok := ad.Tags["type"]; ok && adType == "Worker Node" {
-				workers = append(workers, ad.NodeID)
-				logger.Debug("Discovered worker node: %s", ad.NodeID)
+				// If poolName is specified, filter by pool tag
+				if poolName != "" {
+					if adPool, ok := ad.Tags["pool"]; ok && adPool == poolName {
+						workers = append(workers, ad.NodeID)
+						logger.Debug("Discovered worker node: %s (pool: %s)", ad.NodeID, poolName)
+					}
+					// Skip workers that don't match the pool
+				} else {
+					// No pool filter specified, include all workers
+					workers = append(workers, ad.NodeID)
+					logger.Debug("Discovered worker node: %s", ad.NodeID)
+				}
 			}
 		}
 	}
 
-	logger.Debug("Discovered %d worker nodes", len(workers))
+	if poolName != "" {
+		logger.Debug("Discovered %d worker nodes in pool '%s'", len(workers), poolName)
+	} else {
+		logger.Debug("Discovered %d worker nodes", len(workers))
+	}
 	return workers
 }
 
@@ -152,17 +167,20 @@ func OrderWorkersByJobHash(workers []string, jobID string) []string {
 
 // ScheduleJobWithLease implements the lease-first scheduling algorithm as specified in pullPlan.md.
 // It discovers workers, orders them deterministically, and tries each worker sequentially until
-// one grants a lease and accepts the work submission.
-func ScheduleJobWithLease(nc NetceptorForControlCommand, jobID string, submitParams map[string]interface{}, maxRetries int) error {
+// one grants a lease and accepts the work submission. Optionally filters by poolName if non-empty.
+func ScheduleJobWithLease(nc NetceptorForControlCommand, jobID string, submitParams map[string]interface{}, maxRetries int, poolName string) error {
 	logger := nc.GetLogger()
 
 	if maxRetries <= 0 {
 		maxRetries = 5 // Default from spec
 	}
 
-	// Step 1: Discover worker nodes
-	workers := DiscoverWorkerNodes(nc)
+	// Step 1: Discover worker nodes (optionally filtered by pool)
+	workers := DiscoverWorkerNodes(nc, poolName)
 	if len(workers) == 0 {
+		if poolName != "" {
+			return fmt.Errorf("no workers discovered with lease services in pool '%s'", poolName)
+		}
 		return fmt.Errorf("no workers discovered with lease services")
 	}
 
@@ -268,7 +286,8 @@ func ScheduleJobWithLease(nc NetceptorForControlCommand, jobID string, submitPar
 
 // SubmitJobWithLeaseScheduling is a high-level function that combines lease scheduling with job submission.
 // It implements the complete lease-first workflow: discover workers, request lease, submit with token.
-func SubmitJobWithLeaseScheduling(nc NetceptorForControlCommand, workType, jobID string, params map[string]string) (map[string]interface{}, error) {
+// Optionally filters workers by poolName if non-empty.
+func SubmitJobWithLeaseScheduling(nc NetceptorForControlCommand, workType, jobID string, params map[string]string, poolName string) (map[string]interface{}, error) {
 	logger := nc.GetLogger()
 
 	// Convert string params to interface{} map for scheduling
@@ -287,10 +306,14 @@ func SubmitJobWithLeaseScheduling(nc NetceptorForControlCommand, workType, jobID
 		submitParams["workUnitID"] = jobID
 	}
 
-	logger.Info("Starting lease-based scheduling for job %s, worktype %s", jobID, workType)
+	if poolName != "" {
+		logger.Info("Starting lease-based scheduling for job %s, worktype %s, pool %s", jobID, workType, poolName)
+	} else {
+		logger.Info("Starting lease-based scheduling for job %s, worktype %s", jobID, workType)
+	}
 
 	// Perform lease-first scheduling with enhanced error reporting
-	err := ScheduleJobWithLease(nc, jobID, submitParams, 5)
+	err := ScheduleJobWithLease(nc, jobID, submitParams, 5, poolName)
 	if err != nil {
 		return nil, fmt.Errorf("lease scheduling failed for job %s: %w", jobID, err)
 	}

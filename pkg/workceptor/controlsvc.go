@@ -549,9 +549,15 @@ func (c *workceptorCommand) executeAutoSubmit(ctx context.Context, nc controlsvc
 		workUnitID = ""
 	}
 
+	// Extract optional pool parameter for execution node pool selection
+	poolName, err := strFromMap(c.params, "pool")
+	if err != nil {
+		poolName = ""
+	}
+
 	// Build work parameters (same logic as existing submit)
 	workParams := make(map[string]string)
-	nonParams := []string{"command", "subcommand", "worktype", "tlsclient", "ttl", "signwork", "signature", "workUnitID", "_auto_submit"}
+	nonParams := []string{"command", "subcommand", "worktype", "tlsclient", "ttl", "signwork", "signature", "workUnitID", "pool", "_auto_submit"}
 
 	inNonParams := func(p string) bool {
 		for _, nonparam := range nonParams {
@@ -573,9 +579,12 @@ func (c *workceptorCommand) executeAutoSubmit(ctx context.Context, nc controlsvc
 		workParams[k] = vStr
 	}
 
-	// Discover workers with lease services
-	workers := controlsvc.DiscoverWorkerNodes(nc)
+	// Discover workers with lease services (optionally filtered by pool)
+	workers := controlsvc.DiscoverWorkerNodes(nc, poolName)
 	if len(workers) == 0 {
+		if poolName != "" {
+			return nil, fmt.Errorf("no worker nodes with lease services found in pool '%s'", poolName)
+		}
 		return nil, fmt.Errorf("no worker nodes with lease services found in the mesh")
 	}
 
@@ -623,6 +632,9 @@ func (c *workceptorCommand) executeAutoSubmit(ctx context.Context, nc controlsvc
 	cfr := map[string]interface{}{
 		"unitid":          worker.ID(),
 		"selected_worker": selectedWorker,
+	}
+	if poolName != "" {
+		cfr["pool"] = poolName
 	}
 
 	// Handle stdin input (same as existing submit)

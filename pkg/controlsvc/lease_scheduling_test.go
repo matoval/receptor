@@ -109,11 +109,13 @@ func TestDiscoverWorkerNodes(t *testing.T) {
 	tests := []struct {
 		name           string
 		advertisements []*netceptor.ServiceAdvertisement
+		poolName       string
 		expectedNodes  []string
 	}{
 		{
 			name:           "no advertisements",
 			advertisements: []*netceptor.ServiceAdvertisement{},
+			poolName:       "",
 			expectedNodes:  []string{},
 		},
 		{
@@ -122,6 +124,7 @@ func TestDiscoverWorkerNodes(t *testing.T) {
 				&netceptor.ServiceAdvertisement{NodeID: "node1", Service: "control", Tags: map[string]string{"type": "Control Service"}},
 				&netceptor.ServiceAdvertisement{NodeID: "node2", Service: "tcp-proxy", Tags: map[string]string{"type": "TCP Proxy"}},
 			},
+			poolName:      "",
 			expectedNodes: []string{},
 		},
 		{
@@ -130,6 +133,7 @@ func TestDiscoverWorkerNodes(t *testing.T) {
 				&netceptor.ServiceAdvertisement{NodeID: "worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node"}},
 				&netceptor.ServiceAdvertisement{NodeID: "worker2", Service: "lease", Tags: map[string]string{"type": "Worker Node"}},
 			},
+			poolName:      "",
 			expectedNodes: []string{"worker1", "worker2"},
 		},
 		{
@@ -140,6 +144,7 @@ func TestDiscoverWorkerNodes(t *testing.T) {
 				&netceptor.ServiceAdvertisement{NodeID: "proxy1", Service: "tcp-proxy", Tags: map[string]string{"type": "TCP Proxy"}},
 				&netceptor.ServiceAdvertisement{NodeID: "worker2", Service: "lease", Tags: map[string]string{"type": "Worker Node"}},
 			},
+			poolName:      "",
 			expectedNodes: []string{"worker1", "worker2"},
 		},
 		{
@@ -148,7 +153,57 @@ func TestDiscoverWorkerNodes(t *testing.T) {
 				&netceptor.ServiceAdvertisement{NodeID: "node1", Service: "lease", Tags: map[string]string{"type": "Other"}},
 				&netceptor.ServiceAdvertisement{NodeID: "worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node"}},
 			},
+			poolName:      "",
 			expectedNodes: []string{"worker1"},
+		},
+		{
+			name: "workers with pool tags - filter by production pool",
+			advertisements: []*netceptor.ServiceAdvertisement{
+				&netceptor.ServiceAdvertisement{NodeID: "prod-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+				&netceptor.ServiceAdvertisement{NodeID: "prod-worker2", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+				&netceptor.ServiceAdvertisement{NodeID: "staging-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "staging"}},
+			},
+			poolName:      "production",
+			expectedNodes: []string{"prod-worker1", "prod-worker2"},
+		},
+		{
+			name: "workers with pool tags - filter by staging pool",
+			advertisements: []*netceptor.ServiceAdvertisement{
+				&netceptor.ServiceAdvertisement{NodeID: "prod-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+				&netceptor.ServiceAdvertisement{NodeID: "staging-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "staging"}},
+				&netceptor.ServiceAdvertisement{NodeID: "staging-worker2", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "staging"}},
+			},
+			poolName:      "staging",
+			expectedNodes: []string{"staging-worker1", "staging-worker2"},
+		},
+		{
+			name: "workers with pool tags - no pool specified returns all",
+			advertisements: []*netceptor.ServiceAdvertisement{
+				&netceptor.ServiceAdvertisement{NodeID: "prod-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+				&netceptor.ServiceAdvertisement{NodeID: "staging-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "staging"}},
+				&netceptor.ServiceAdvertisement{NodeID: "worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node"}},
+			},
+			poolName:      "",
+			expectedNodes: []string{"prod-worker1", "staging-worker1", "worker1"},
+		},
+		{
+			name: "workers with pool tags - nonexistent pool returns empty",
+			advertisements: []*netceptor.ServiceAdvertisement{
+				&netceptor.ServiceAdvertisement{NodeID: "prod-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+				&netceptor.ServiceAdvertisement{NodeID: "staging-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "staging"}},
+			},
+			poolName:      "nonexistent",
+			expectedNodes: []string{},
+		},
+		{
+			name: "mixed workers with and without pool tags - filter by pool",
+			advertisements: []*netceptor.ServiceAdvertisement{
+				&netceptor.ServiceAdvertisement{NodeID: "prod-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+				&netceptor.ServiceAdvertisement{NodeID: "worker-no-pool", Service: "lease", Tags: map[string]string{"type": "Worker Node"}},
+				&netceptor.ServiceAdvertisement{NodeID: "prod-worker2", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+			},
+			poolName:      "production",
+			expectedNodes: []string{"prod-worker1", "prod-worker2"},
 		},
 	}
 
@@ -159,7 +214,7 @@ func TestDiscoverWorkerNodes(t *testing.T) {
 				advertisements: tt.advertisements,
 			}
 
-			nodes := DiscoverWorkerNodes(mockNetceptor)
+			nodes := DiscoverWorkerNodes(mockNetceptor, tt.poolName)
 
 			if len(nodes) != len(tt.expectedNodes) {
 				t.Errorf("Expected %d nodes, got %d", len(tt.expectedNodes), len(nodes))
@@ -318,12 +373,33 @@ func TestScheduleJobWithLease(t *testing.T) {
 			"worktype": "test",
 		}
 
-		err := ScheduleJobWithLease(mockNetceptor, "job1", submitParams, 5)
+		err := ScheduleJobWithLease(mockNetceptor, "job1", submitParams, 5, "")
 		if err == nil {
 			t.Fatal("Expected error when no workers available")
 		}
-		if !strings.Contains(err.Error(), "no worker nodes discovered") {
-			t.Errorf("Expected 'no worker nodes discovered' error, got: %v", err)
+		if !strings.Contains(err.Error(), "no workers discovered") {
+			t.Errorf("Expected 'no workers discovered' error, got: %v", err)
+		}
+	})
+
+	t.Run("no workers in specified pool", func(t *testing.T) {
+		mockNetceptor := &mockNetceptorForControl{
+			logger: logger,
+			advertisements: []*netceptor.ServiceAdvertisement{
+				&netceptor.ServiceAdvertisement{NodeID: "worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+			},
+		}
+
+		submitParams := map[string]interface{}{
+			"worktype": "test",
+		}
+
+		err := ScheduleJobWithLease(mockNetceptor, "job1", submitParams, 5, "staging")
+		if err == nil {
+			t.Fatal("Expected error when no workers in pool")
+		}
+		if !strings.Contains(err.Error(), "no workers discovered") || !strings.Contains(err.Error(), "staging") {
+			t.Errorf("Expected pool-specific error, got: %v", err)
 		}
 	})
 
@@ -343,7 +419,7 @@ func TestScheduleJobWithLease(t *testing.T) {
 		}
 
 		// For this test, we'll test the worker discovery part
-		workers := DiscoverWorkerNodes(mockNetceptor)
+		workers := DiscoverWorkerNodes(mockNetceptor, "")
 		if len(workers) != 1 || workers[0] != "worker1" {
 			t.Errorf("Expected to discover worker1, got %v", workers)
 		}
@@ -368,12 +444,12 @@ func TestSubmitJobWithLeaseScheduling(t *testing.T) {
 		params := map[string]string{"param1": "value1"}
 
 		// Should fail due to no workers, but should generate job ID
-		_, err := SubmitJobWithLeaseScheduling(mockNetceptor, "test-worktype", "", params)
+		_, err := SubmitJobWithLeaseScheduling(mockNetceptor, "test-worktype", "", params, "")
 		if err == nil {
 			t.Fatal("Expected error due to no workers")
 		}
 
-		if !strings.Contains(err.Error(), "no worker nodes discovered") {
+		if !strings.Contains(err.Error(), "no workers discovered") {
 			t.Errorf("Expected scheduling error, got: %v", err)
 		}
 	})
@@ -388,13 +464,46 @@ func TestSubmitJobWithLeaseScheduling(t *testing.T) {
 		jobID := "custom-job-id"
 
 		// Should fail due to no workers, but should use provided job ID
-		_, err := SubmitJobWithLeaseScheduling(mockNetceptor, "test-worktype", jobID, params)
+		_, err := SubmitJobWithLeaseScheduling(mockNetceptor, "test-worktype", jobID, params, "")
 		if err == nil {
 			t.Fatal("Expected error due to no workers")
 		}
 
 		if !strings.Contains(err.Error(), jobID) {
 			t.Errorf("Error should mention job ID %s, got: %v", jobID, err)
+		}
+	})
+
+	t.Run("schedules to specific pool", func(t *testing.T) {
+		mockNetceptor := &mockNetceptorForControl{
+			logger: logger,
+			advertisements: []*netceptor.ServiceAdvertisement{
+				&netceptor.ServiceAdvertisement{NodeID: "prod-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "production"}},
+				&netceptor.ServiceAdvertisement{NodeID: "staging-worker1", Service: "lease", Tags: map[string]string{"type": "Worker Node", "pool": "staging"}},
+			},
+		}
+
+		params := map[string]string{"param1": "value1"}
+
+		// Test worker discovery with pool filter for production
+		workers := DiscoverWorkerNodes(mockNetceptor, "production")
+		if len(workers) != 1 || workers[0] != "prod-worker1" {
+			t.Errorf("Expected to discover only prod-worker1, got %v", workers)
+		}
+
+		// Test worker discovery with pool filter for staging
+		workers = DiscoverWorkerNodes(mockNetceptor, "staging")
+		if len(workers) != 1 || workers[0] != "staging-worker1" {
+			t.Errorf("Expected to discover only staging-worker1, got %v", workers)
+		}
+
+		// Test that scheduling with nonexistent pool fails
+		_, err := SubmitJobWithLeaseScheduling(mockNetceptor, "test-worktype", "test-job", params, "nonexistent")
+		if err == nil {
+			t.Fatal("Expected error when scheduling with nonexistent pool")
+		}
+		if !strings.Contains(err.Error(), "nonexistent") {
+			t.Errorf("Expected error to mention pool 'nonexistent', got: %v", err)
 		}
 	})
 }

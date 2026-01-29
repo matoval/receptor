@@ -10,6 +10,7 @@ The Receptor Leasing Service introduces **auto-selecting work submission**, tran
 - **Intelligent Load Balancing**: Jobs distributed evenly across available workers
 - **Capacity Awareness**: Respects worker limits and handles backpressure
 - **Fault Tolerance**: Automatic retry across multiple workers
+- **Execution Node Pools**: Group workers into pools for targeted auto-selection
 - **Backward Compatibility**: Existing explicit targeting continues to work
 
 ## Architecture Overview
@@ -68,6 +69,76 @@ The control node tries workers sequentially until one grants a lease:
 2. Request lease from worker1 → "GRANTED" ✓
 3. Submit job to worker1 with lease token
 ```
+
+## Execution Node Pools
+
+Execution node pools allow you to group workers by environment, region, or capability, enabling targeted auto-selection within specific worker subsets.
+
+### Why Use Pools?
+
+- **Environment Isolation**: Separate production, staging, and development execution nodes
+- **Geographic Distribution**: Route jobs to workers in specific data centers or regions
+- **Capacity Tiers**: Group high-capacity vs. low-capacity workers
+- **Workload Specialization**: Dedicated pools for long-running jobs vs. quick tasks
+
+### How Pools Work
+
+Workers advertise their pool membership via service tags. When submitting with `submit_auto`, you can optionally specify a pool name to limit worker discovery to only workers in that pool.
+
+**Pool Configuration Example:**
+
+```yaml
+# Production Worker Configuration
+- node:
+    id: prod-worker1
+
+- lease-service:
+    service: lease
+    pool: production      # Worker advertises membership in "production" pool
+    maxrunningjobs: 10
+
+# Staging Worker Configuration
+- node:
+    id: staging-worker1
+
+- lease-service:
+    service: lease
+    pool: staging         # Worker advertises membership in "staging" pool
+    maxrunningjobs: 5
+```
+
+**Submitting to a Specific Pool:**
+
+```bash
+# Submit to production pool only
+echo '{"command":"work","subcommand":"submit_auto","worktype":"ansible-playbook","pool":"production"}' | nc -U /tmp/control1.sock
+
+# Submit to staging pool only
+echo '{"command":"work","subcommand":"submit_auto","worktype":"ansible-playbook","pool":"staging"}' | nc -U /tmp/control1.sock
+
+# Submit to any available worker (no pool specified)
+echo '{"command":"work","subcommand":"submit_auto","worktype":"ansible-playbook"}' | nc -U /tmp/control1.sock
+```
+
+**Pool Response:**
+
+```json
+{
+  "result": "Job Started",
+  "unitid": "control1-abc123",
+  "selected_worker": "prod-worker1",
+  "pool": "production"
+}
+```
+
+### Pool Discovery Process
+
+When a pool is specified:
+
+1. Control node scans service advertisements for lease services with `type: "Worker Node"` **AND** `pool: "specified-pool"`
+2. Only workers matching both the worker type and pool name are considered
+3. If no workers are found in the specified pool, an error is returned immediately
+4. Workers are ordered and tried using the same deterministic algorithm
 
 ## Network Protocol
 
@@ -152,17 +223,21 @@ echo '{"command":"work","subcommand":"submit","worktype":"countdown","node":"wor
 ### Command Parameters
 
 **Required Parameters:**
+
 - `command`: `"work"`
 - `subcommand`: `"submit_auto"`
 - `worktype`: Job type (e.g., `"countdown"`, `"ansible-playbook"`)
 
 **Optional Parameters:**
+
+- `pool`: Execution node pool name (filters workers to specified pool)
 - `workUnitID`: Custom job ID (auto-generated if omitted)
 - `tlsclient`: TLS client certificate
 - `ttl`: Job timeout
 - `params`: Additional job parameters
 
 **Prohibited Parameters:**
+
 - `node`: Explicitly rejected (use `"submit"` for explicit targeting)
 
 ## Configuration
@@ -189,6 +264,7 @@ echo '{"command":"work","subcommand":"submit","worktype":"countdown","node":"wor
 
 - lease-service:
     service: lease
+    pool: production              # Optional: pool name for grouping workers
     maxrunningjobs: 1
     maxoutstandingleases: 1
 
@@ -204,11 +280,15 @@ echo '{"command":"work","subcommand":"submit","worktype":"countdown","node":"wor
 ### Key Configuration Settings
 
 **Lease Service Settings:**
+
 - `maxrunningjobs`: Maximum concurrent jobs (typically 1)
 - `maxoutstandingleases`: Maximum outstanding lease requests (typically 1)
+- `pool`: Optional pool name for grouping workers (omit for no pool)
 
 **Service Advertisement:**
+
 - Workers automatically advertise `lease` service with `type: "Worker Node"` tag
+- If `pool` is configured, workers also advertise `pool: "pool-name"` tag
 - Control node discovers workers via these advertisements
 
 ## Message Flow Example
@@ -255,6 +335,13 @@ echo '{"command":"work","subcommand":"submit","worktype":"countdown","node":"wor
 ```json
 {
   "error": "no worker nodes with lease services found in the mesh"
+}
+```
+
+**No Workers in Pool:**
+```json
+{
+  "error": "no worker nodes with lease services found in pool 'production'"
 }
 ```
 
@@ -349,10 +436,12 @@ find /tmp/receptor/worker* -name "control1*" -type d | wc -l
 ### When to Use Auto-Selection
 
 ✅ **Use `submit_auto` when:**
+
 - You want optimal load balancing
 - Worker topology may change
 - You need fault tolerance
 - You don't care which specific worker executes the job
+- You want to target a group of workers via pool name
 
 ### When to Use Explicit Targeting
 
@@ -368,6 +457,7 @@ find /tmp/receptor/worker* -name "control1*" -type d | wc -l
 - Monitor lease denial rates to identify capacity bottlenecks
 - Use multiple workers to provide redundancy
 - Consider job duration when planning capacity
+- Use pools to isolate workloads and prevent resource contention between environments
 
 ## Troubleshooting
 
@@ -375,6 +465,9 @@ find /tmp/receptor/worker* -name "control1*" -type d | wc -l
 
 **Issue**: "no worker nodes with lease services found"
 **Solution**: Verify worker lease service configuration and network connectivity
+
+**Issue**: "no worker nodes with lease services found in pool 'poolname'"
+**Solution**: Verify workers are configured with correct pool name, check pool spelling, ensure workers have advertised successfully
 
 **Issue**: "all workers denied lease due to capacity"
 **Solution**: Increase `maxrunningjobs` on workers or add more worker nodes
@@ -388,11 +481,17 @@ find /tmp/receptor/worker* -name "control1*" -type d | wc -l
 # Check worker discovery
 echo '{"command":"status"}' | nc -U /tmp/control1.sock | grep lease
 
+# Check which pools are available
+echo '{"command":"status"}' | nc -U /tmp/control1.sock | jq '.Advertisements[] | select(.Service=="lease") | {NodeID, Pool: .Tags.pool}'
+
 # Test explicit submission to specific worker
 echo '{"command":"work","subcommand":"submit","worktype":"countdown","node":"worker1"}' | nc -U /tmp/control1.sock
 
 # Test auto submission
 echo '{"command":"work","subcommand":"submit_auto","worktype":"countdown"}' | nc -U /tmp/control1.sock
+
+# Test auto submission with pool
+echo '{"command":"work","subcommand":"submit_auto","worktype":"countdown","pool":"production"}' | nc -U /tmp/control1.sock
 
 # Monitor job completion
 find /tmp/receptor/worker* -name "stdout" -path "*/control1*" -exec head -1 {} \;

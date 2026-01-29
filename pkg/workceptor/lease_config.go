@@ -17,6 +17,7 @@ import (
 type LeaseServiceCfg struct {
 	Service              string `required:"true" description:"Receptor service name to listen on"`
 	TLS                  string `description:"Name of TLS server config for the Receptor listener"`
+	Pool                 string `description:"Execution node pool name for grouping workers" default:""`
 	MaxRunningJobs       int    `description:"Maximum number of concurrent running jobs" default:"10"`
 	MaxOutstandingLeases int    `description:"Maximum number of outstanding leases (0 = same as max_running_jobs)" default:"0"`
 	LeaseTTLMs          int    `description:"Default lease TTL in milliseconds" default:"10000"`
@@ -60,7 +61,7 @@ func (cfg LeaseServiceCfg) Run() error {
 	}
 
 	// Start the lease service
-	err = LeaseService(ctx, netceptor.MainInstance, cfg.Service, tlsCfg, leaseManager)
+	err = LeaseService(ctx, netceptor.MainInstance, cfg.Service, tlsCfg, cfg.Pool, leaseManager)
 	if err != nil {
 		return fmt.Errorf("error starting lease service: %s", err)
 	}
